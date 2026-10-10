@@ -256,6 +256,14 @@ export class ScannerRepository {
       .where(eq(bookFiles.libraryFolderId, libraryFolderId));
   }
 
+  async findArchiveBookFiles(libraryFolderId: number, zipPath: string) {
+    return this.db
+      .select({ bookId: bookFiles.bookId, absolutePath: bookFiles.absolutePath, status: books.status })
+      .from(bookFiles)
+      .innerJoin(books, eq(books.id, bookFiles.bookId))
+      .where(and(eq(bookFiles.libraryFolderId, libraryFolderId), sql`starts_with(${bookFiles.absolutePath}, ${`${zipPath}/`})`));
+  }
+
   async findBookFileByHash(fileHash: string, libraryFolderId: number) {
     const [file] = await this.db
       .select()

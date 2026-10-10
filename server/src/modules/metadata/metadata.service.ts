@@ -93,6 +93,29 @@ export class MetadataService {
     await this.extractAndSaveIfAvailable(bookId, absolutePath, format);
   }
 
+  /** Saves metadata that came from a catalog index rather than from the book file itself. */
+  async saveParsedMetadata(bookId: number, data: ParsedBookData, format: string): Promise<void> {
+    await this.persistMetadata(bookId, data, format);
+    await this.scoreService.calculateAndSave(bookId);
+  }
+
+  /** Fills the cover and annotation a catalog index cannot carry, leaving every other field as the index set it. */
+  async fillCoverAndDescriptionFromFile(bookId: number, absolutePath: string, format: string): Promise<void> {
+    const data = await this.extractionService.extract(absolutePath, format);
+    if (!data) return;
+    if (data.cover) await this.persistCover(bookId, this.mediumForFormat(format), data.cover, false, 'embedded');
+    if (data.description) {
+      const { dto } = await this.bookMetadataLockService.filterAutomatedBookUpdate(bookId, { description: data.description });
+      if (dto.description !== undefined) {
+        await this.db
+          .update(bookMetadata)
+          .set({ description: dto.description, updatedAt: new Date() })
+          .where(and(eq(bookMetadata.bookId, bookId), sql`${bookMetadata.description} is null`));
+      }
+    }
+    await this.scoreService.calculateAndSave(bookId);
+  }
+
   async extractAndSaveIfAvailable(bookId: number, absolutePath: string, format: string): Promise<boolean> {
     const event = 'metadata.extract_and_save';
     const startedAt = Date.now();

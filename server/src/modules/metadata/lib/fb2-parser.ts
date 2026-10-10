@@ -1,4 +1,4 @@
-import { readFile } from 'fs/promises';
+import { readBookFile } from '../../../common/archive/zip-member';
 import { XMLParser } from 'fast-xml-parser';
 import { parseSeriesIndex } from '@bookorbit/types';
 
@@ -149,7 +149,7 @@ export async function parseFb2File(absolutePath: string): Promise<Fb2Metadata | 
   try {
     // FB2 is commonly published in windows-1251 or koi8-r, so honour the
     // encoding declared in the file instead of assuming UTF-8.
-    const { text: xml } = decodeFb2Document(await readFile(absolutePath));
+    const { text: xml } = decodeFb2Document(await readBookFile(absolutePath));
     const doc = parser.parse(xml) as Record<string, unknown>;
 
     const fb = (doc['FictionBook'] ?? doc['fictionbook']) as Record<string, unknown> | undefined;

@@ -175,6 +175,7 @@ function makeService(
     notificationService as any,
     selfWriteRegistry,
     coverStore as any,
+    { findIndex: () => Promise.resolve(null) } as any,
     autoFetchOrchestrator as any,
     achievementEvents as any,
     coverReconciler as any,

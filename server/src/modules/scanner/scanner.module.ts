@@ -17,6 +17,7 @@ import { ScanJobStore } from './scan-job-store.service';
 import { ScannerController } from './scanner.controller';
 import { ScannerRepository } from './scanner.repository';
 import { ScannerService } from './scanner.service';
+import { InpxImportService } from './inpx-import.service';
 
 @Module({
   imports: [
@@ -36,7 +37,7 @@ import { ScannerService } from './scanner.service';
     }),
   ],
   controllers: [ScannerController],
-  providers: [ScannerService, ScannerRepository, ScanGateway, ScanJobStore, FileEventProcessorService, FileWatcherService],
+  providers: [ScannerService, InpxImportService, ScannerRepository, ScanGateway, ScanJobStore, FileEventProcessorService, FileWatcherService],
   exports: [ScannerService, FileWatcherService, ScanGateway],
 })
 export class ScannerModule {}

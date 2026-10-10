@@ -20,6 +20,7 @@ import { ZipArchive } from 'archiver';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import type { FastifyReply } from 'fastify';
+import { openBookFileStream, parseZipMemberPath } from '../../common/archive/zip-member';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermission } from '../../common/decorators/require-permission.decorator';
 import { contentDispositionHeader } from '../../common/utils/content-disposition.utils';
@@ -405,11 +406,13 @@ export class BookController {
     const mimeType = resolveBookMimeType(format);
     const filename = originalFilename;
 
-    reply.header('Accept-Ranges', 'bytes');
+    // An archive entry is inflated as a whole, so it is always served in full.
+    const inArchive = parseZipMemberPath(path) !== null;
+    reply.header('Accept-Ranges', inArchive ? 'none' : 'bytes');
     reply.header('Content-Disposition', contentDispositionHeader('inline', filename, 'download'));
     reply.type(mimeType);
 
-    if (rangeHeader) {
+    if (rangeHeader && !inArchive) {
       const match = /bytes=(\d+)-(\d*)/.exec(rangeHeader);
       if (match) {
         const start = parseInt(match[1], 10);
@@ -429,7 +432,7 @@ export class BookController {
     }
 
     reply.header('Content-Length', size);
-    reply.send(createReadStream(path));
+    reply.send(await openBookFileStream(path));
   }
 
   @Get('files/:fileId/download')
@@ -452,7 +455,7 @@ export class BookController {
       reply.header('Content-Disposition', contentDispositionHeader('attachment', filename, 'download'));
       reply.type(mimeType);
       reply.header('Content-Length', size);
-      reply.send(createReadStream(path));
+      reply.send(await openBookFileStream(path));
       this.logger.log(
         `[${event}] [end] fileId=${fileId} userId=${user.id} durationMs=${Date.now() - startedAt} sizeBytes=${size} - download file completed`,
       );

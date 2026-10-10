@@ -46,6 +46,7 @@ import {
   type WalkResult,
 } from './lib/walk';
 import { ScannerRepository } from './scanner.repository';
+import { InpxImportService } from './inpx-import.service';
 import { assembleBookCards } from '../book/utils/assemble-book-cards';
 import { LIBRARY_METADATA_PRECEDENCE_DEFAULT } from '../library/library.constants';
 import { inspectEpubMediaOverlayFields, type EpubMediaOverlayColumnFields } from '../reader/epub/epub-media-overlay-capability';
@@ -248,6 +249,7 @@ export class ScannerService implements OnApplicationBootstrap {
     private readonly notificationService: NotificationService,
     private readonly selfWriteRegistry: SelfWriteRegistry,
     private readonly coverStore: BookCoverStore,
+    private readonly inpxImport: InpxImportService,
     @Optional() private readonly autoFetchOrchestrator?: BookMetadataFetchOrchestratorService,
     @Optional() private readonly achievementEvents?: AchievementEventsService,
     @Optional() private readonly coverReconciler?: CoverSlotReconciler,
@@ -1401,6 +1403,32 @@ export class ScannerService implements OnApplicationBootstrap {
       this.emitFromStore(libraryId, jobId, 'running');
 
       for (const folder of folders) {
+        const indexPath = await this.inpxImport.findIndex(folder.path);
+        if (indexPath) {
+          const counts = await this.inpxImport.importFolder({
+            libraryId,
+            libraryFolderId: folder.id,
+            folderPath: folder.path,
+            indexPath,
+            useIndexDates: addedAtSource !== 'imported',
+            onTotal: (rows) => {
+              totalCandidates += rows;
+              this.scanJobStore.setTotal(libraryId, totalCandidates);
+            },
+            onProgress: () => {
+              const entry = this.scanJobStore.increment(libraryId, { processed: 1 });
+              if (entry && this.scanJobStore.shouldEmit(entry)) {
+                this.emitFromStore(libraryId, jobId, 'running');
+                this.scanJobStore.markEmitted(entry);
+              }
+            },
+          });
+          totals.addedCount += counts.addedCount;
+          totals.updatedCount += counts.updatedCount;
+          totals.missingCount += counts.missingCount;
+          continue;
+        }
+
         let candidates: BookCandidate[] = [];
         let skippedDirs = new Set<string>();
         let unchangedDirs = new Set<string>();

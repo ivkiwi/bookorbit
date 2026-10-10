@@ -21,6 +21,7 @@ import { ScannerController } from './scanner.controller';
 import { ScannerModule } from './scanner.module';
 import { ScannerRepository } from './scanner.repository';
 import { ScannerService } from './scanner.service';
+import { InpxImportService } from './inpx-import.service';
 
 describe('ScannerModule', () => {
   it('registers expected imports/controllers/providers/exports', () => {
@@ -37,6 +38,7 @@ describe('ScannerModule', () => {
     expect(Reflect.getMetadata('controllers', ScannerModule)).toEqual([ScannerController]);
     expect(Reflect.getMetadata('providers', ScannerModule)).toEqual([
       ScannerService,
+      InpxImportService,
       ScannerRepository,
       ScanGateway,
       ScanJobStore,

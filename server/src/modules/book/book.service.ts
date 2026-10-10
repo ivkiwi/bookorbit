@@ -14,6 +14,7 @@ import { ConfigService } from '@nestjs/config';
 import { mkdtemp, rm, stat, rename } from 'fs/promises';
 import { inArray, type SQL } from 'drizzle-orm';
 
+import { parseZipMemberPath, statBookFile } from '../../common/archive/zip-member';
 import { MAX_BOOK_QUERY_OFFSET_ROWS, isBookQueryOffsetWithinLimit } from '../../common/constants/pagination.constants';
 import { compareAudioTracks, coverFetchInputs, resolveIsAudiobook } from '../../common/utils/book-media.utils';
 import { sanitizeLogValue } from '../../common/utils/log-sanitize.utils';
@@ -276,6 +277,7 @@ export type ProgressStatusFileContext = {
 @Injectable()
 export class BookService {
   private readonly logger = new Logger(BookService.name);
+  private readonly archiveFillAttempts = new Set<number>();
   private readonly appDataPath: string;
   private embeddingRun: Promise<void> | null = null;
   private metadataUpdateFailpoint: MetadataUpdateFailpoint | null = null;
@@ -1448,7 +1450,7 @@ export class BookService {
     const file = await this.verifyFileAccess(fileId, user);
     let size: number;
     try {
-      ({ size } = await stat(file.absolutePath));
+      ({ size } = await statBookFile(file.absolutePath));
     } catch (err) {
       if (this.isMissingFilesystemEntry(err)) {
         throw new NotFoundException(`File ${fileId} not found on disk`);
@@ -3149,7 +3151,7 @@ export class BookService {
     }
 
     try {
-      const { size } = await stat(file.absolutePath);
+      const { size } = await statBookFile(file.absolutePath);
       return size;
     } catch (err) {
       if (this.isMissingFilesystemEntry(err)) {
@@ -3249,6 +3251,18 @@ export class BookService {
     }
   }
 
+  // Archive books are cataloged from their index without being read, so the book itself supplies the
+  // cover and annotation the first time someone opens it.
+  private fillArchiveBookOnFirstOpen(bookId: number, primary: { absolutePath: string; format: string | null } | undefined, hasCover: boolean): void {
+    if (hasCover || !primary?.format || !parseZipMemberPath(primary.absolutePath) || this.archiveFillAttempts.has(bookId)) return;
+    this.archiveFillAttempts.add(bookId);
+    this.metadataService.fillCoverAndDescriptionFromFile(bookId, primary.absolutePath, primary.format).catch((err: Error) => {
+      this.logger.warn(
+        `[book.fill_archive_book] [fail] bookId=${bookId} errorClass=${err.name} error="${sanitizeLogValue(err.message)}" - archive book cover and annotation fill failed`,
+      );
+    });
+  }
+
   async getDetail(id: number, user: RequestUser): Promise<BookDetailDto> {
     await this.verifyBookAccess(id, user);
     const [result, personalRating, personalNote, readStatus, comicMeta, collectionRows, readAloudSyncMode, coverContext] = await Promise.all([
@@ -3285,6 +3299,12 @@ export class BookService {
     });
     const mediaOverlayByFileId = await this.resolveMediaOverlayCapabilities(fileRows);
     const readAloudSync = this.buildReadAloudProgressSync(fileRows, mediaOverlayByFileId, book.books.primaryFileId, readAloudSyncMode);
+    const covers = coverContext ? this.coverStore.slotDtos(coverContext) : { ebook: null, audio: null };
+    this.fillArchiveBookOnFirstOpen(
+      id,
+      fileRows.find((file) => file.id === book.books.primaryFileId),
+      covers.ebook !== null,
+    );
 
     return {
       id: book.books.id,
@@ -3314,7 +3334,7 @@ export class BookService {
       communityRatings: this.mapCommunityRatingRows(communityRatingRows),
       coverSource: (meta?.coverSource as 'extracted' | 'custom' | null) ?? null,
       coverMedia: [...(coverContext?.media.hasEbook ? (['ebook'] as const) : []), ...(coverContext?.media.hasAudio ? (['audio'] as const) : [])],
-      covers: coverContext ? this.coverStore.slotDtos(coverContext) : { ebook: null, audio: null },
+      covers,
       coverVersion: this.coverStore.coverVersion(
         book.libraries?.coverAspectRatio ?? '2/3',
         coverContext?.slots ?? [],

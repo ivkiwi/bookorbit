@@ -19,6 +19,7 @@ import { tmpdir } from 'os';
 import { join } from 'path';
 import type { FastifyReply } from 'fastify';
 
+import { openBookFileStream, statBookFile } from '../../common/archive/zip-member';
 import { MAX_OFFSET_ROWS, isOffsetWithinLimit } from '../../common/constants/pagination.constants';
 import { Public } from '../../common/decorators/public.decorator';
 import { imageContentTypeFromPath } from '../../common/image-content-type';
@@ -294,7 +295,7 @@ export class OpdsController {
     const served = bookFiles.readAlong ? await this.audiolessCopy(absolutePath, bookId, fileId) : null;
     const servedPath = served?.path ?? absolutePath;
     try {
-      const { size: fileSize } = await stat(servedPath);
+      const { size: fileSize } = await statBookFile(servedPath);
       const filename = await this.bookService.resolveDownloadFilename({
         bookId,
         absolutePath,
@@ -305,7 +306,7 @@ export class OpdsController {
       reply.header('Content-Disposition', contentDispositionHeader('attachment', filename, 'download'));
       reply.header('Content-Length', fileSize);
       reply.type(fileMimeType(format));
-      const stream = createReadStream(servedPath);
+      const stream = await openBookFileStream(servedPath);
       // The rebuilt copy is only safe to delete once the response has finished reading it.
       if (served) stream.once('close', () => void served.cleanup().catch(() => undefined));
       reply.send(stream);
