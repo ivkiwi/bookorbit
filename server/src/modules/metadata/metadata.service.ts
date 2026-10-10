@@ -100,9 +100,9 @@ export class MetadataService {
   }
 
   /** Fills the cover and annotation a catalog index cannot carry, leaving every other field as the index set it. */
-  async fillCoverAndDescriptionFromFile(bookId: number, absolutePath: string, format: string): Promise<void> {
+  async fillCoverAndDescriptionFromFile(bookId: number, absolutePath: string, format: string): Promise<boolean> {
     const data = await this.extractionService.extract(absolutePath, format);
-    if (!data) return;
+    if (!data) return false;
     if (data.cover) await this.persistCover(bookId, this.mediumForFormat(format), data.cover, false, 'embedded');
     if (data.description) {
       const { dto } = await this.bookMetadataLockService.filterAutomatedBookUpdate(bookId, { description: data.description });
@@ -114,6 +114,7 @@ export class MetadataService {
       }
     }
     await this.scoreService.calculateAndSave(bookId);
+    return true;
   }
 
   async extractAndSaveIfAvailable(bookId: number, absolutePath: string, format: string): Promise<boolean> {

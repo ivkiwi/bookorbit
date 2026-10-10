@@ -277,7 +277,7 @@ export type ProgressStatusFileContext = {
 @Injectable()
 export class BookService {
   private readonly logger = new Logger(BookService.name);
-  private readonly archiveFillAttempts = new Set<number>();
+  private readonly filledArchiveBooks = new Set<number>();
   private readonly appDataPath: string;
   private embeddingRun: Promise<void> | null = null;
   private metadataUpdateFailpoint: MetadataUpdateFailpoint | null = null;
@@ -1446,11 +1446,20 @@ export class BookService {
   async getFileInfo(
     fileId: number,
     user: RequestUser,
-  ): Promise<{ path: string; size: number; format: string; bookId: number; originalFilename: string; mediaOverlayAvailable: boolean }> {
+  ): Promise<{
+    path: string;
+    size: number;
+    format: string;
+    bookId: number;
+    originalFilename: string;
+    mediaOverlayAvailable: boolean;
+    inArchive: boolean;
+  }> {
     const file = await this.verifyFileAccess(fileId, user);
     let size: number;
+    let inArchive: boolean;
     try {
-      ({ size } = await statBookFile(file.absolutePath));
+      ({ size, inArchive } = await statBookFile(file.absolutePath));
     } catch (err) {
       if (this.isMissingFilesystemEntry(err)) {
         throw new NotFoundException(`File ${fileId} not found on disk`);
@@ -1465,6 +1474,7 @@ export class BookService {
       bookId: file.bookId,
       originalFilename,
       mediaOverlayAvailable: file.mediaOverlayAvailable,
+      inArchive,
     };
   }
 
@@ -3253,19 +3263,28 @@ export class BookService {
 
   // Archive books are cataloged from their index without being read, so the book itself supplies the
   // cover and annotation the first time someone opens it.
-  private fillArchiveBookOnFirstOpen(bookId: number, primary: { absolutePath: string; format: string | null } | undefined, hasCover: boolean): void {
-    if (hasCover || !primary?.format || !parseZipMemberPath(primary.absolutePath) || this.archiveFillAttempts.has(bookId)) return;
-    this.archiveFillAttempts.add(bookId);
-    this.metadataService.fillCoverAndDescriptionFromFile(bookId, primary.absolutePath, primary.format).catch((err: Error) => {
+  // A failed read is not remembered, so the next open tries again.
+  private async fillArchiveBookOnFirstOpen(
+    bookId: number,
+    primary: { absolutePath: string; format: string | null } | undefined,
+    hasCover: boolean,
+  ): Promise<boolean> {
+    if (hasCover || !primary?.format || !parseZipMemberPath(primary.absolutePath) || this.filledArchiveBooks.has(bookId)) return false;
+    try {
+      if (!(await this.metadataService.fillCoverAndDescriptionFromFile(bookId, primary.absolutePath, primary.format))) return false;
+      this.filledArchiveBooks.add(bookId);
+      return true;
+    } catch (err) {
       this.logger.warn(
-        `[book.fill_archive_book] [fail] bookId=${bookId} errorClass=${err.name} error="${sanitizeLogValue(err.message)}" - archive book cover and annotation fill failed`,
+        `[book.fill_archive_book] [fail] bookId=${bookId} errorClass=${err instanceof Error ? err.name : 'Error'} error="${sanitizeLogValue(err instanceof Error ? err.message : String(err))}" - archive book cover and annotation fill failed`,
       );
-    });
+      return false;
+    }
   }
 
   async getDetail(id: number, user: RequestUser): Promise<BookDetailDto> {
     await this.verifyBookAccess(id, user);
-    const [result, personalRating, personalNote, readStatus, comicMeta, collectionRows, readAloudSyncMode, coverContext] = await Promise.all([
+    const [loaded, personalRating, personalNote, readStatus, comicMeta, collectionRows, readAloudSyncMode, loadedCoverContext] = await Promise.all([
       this.bookRepo.findById(id),
       this.bookRepo.findRatingByBookAndUser(id, user.id),
       this.userBookNoteService.findOne(user.id, id),
@@ -3275,6 +3294,15 @@ export class BookService {
       this.bookRepo.findReadAloudSyncMode(user.id, id),
       this.coverStore.contextFor(id),
     ]);
+    if (!loaded) throw new NotFoundException(`Book ${id} not found`);
+    const filled = await this.fillArchiveBookOnFirstOpen(
+      id,
+      loaded.fileRows.find((file) => file.id === loaded.book.books.primaryFileId),
+      loadedCoverContext !== null && this.coverStore.slotDtos(loadedCoverContext).ebook !== null,
+    );
+    const [result, coverContext] = filled
+      ? await Promise.all([this.bookRepo.findById(id), this.coverStore.contextFor(id)])
+      : [loaded, loadedCoverContext];
     if (!result) throw new NotFoundException(`Book ${id} not found`);
 
     const { book, authorRows, genreRows, tagRows, fileRows, narratorRows, seriesMembershipRows, communityRatingRows } = result;
@@ -3300,11 +3328,6 @@ export class BookService {
     const mediaOverlayByFileId = await this.resolveMediaOverlayCapabilities(fileRows);
     const readAloudSync = this.buildReadAloudProgressSync(fileRows, mediaOverlayByFileId, book.books.primaryFileId, readAloudSyncMode);
     const covers = coverContext ? this.coverStore.slotDtos(coverContext) : { ebook: null, audio: null };
-    this.fillArchiveBookOnFirstOpen(
-      id,
-      fileRows.find((file) => file.id === book.books.primaryFileId),
-      covers.ebook !== null,
-    );
 
     return {
       id: book.books.id,

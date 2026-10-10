@@ -20,7 +20,7 @@ import { ZipArchive } from 'archiver';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import type { FastifyReply } from 'fastify';
-import { openBookFileStream, parseZipMemberPath } from '../../common/archive/zip-member';
+import { lazyBookFileStream, openBookFileStream, parseZipMemberPath } from '../../common/archive/zip-member';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermission } from '../../common/decorators/require-permission.decorator';
 import { contentDispositionHeader } from '../../common/utils/content-disposition.utils';
@@ -308,7 +308,8 @@ export class BookController {
       reply.raw.setHeader('Content-Disposition', contentDispositionHeader('attachment', plan.archiveFilename || 'books.zip', 'books.zip'));
       archive.pipe(reply.raw);
       for (const file of plan.files) {
-        archive.file(file.absolutePath, { name: file.zipPath });
+        if (parseZipMemberPath(file.absolutePath)) archive.append(lazyBookFileStream(file.absolutePath), { name: file.zipPath });
+        else archive.file(file.absolutePath, { name: file.zipPath });
       }
       await Promise.race([archive.finalize(), archiveFailure]);
 
@@ -401,13 +402,12 @@ export class BookController {
     @Headers('range') rangeHeader: string | undefined,
     @Res() reply: FastifyReply,
   ) {
-    const { path, size, format, originalFilename } = await this.bookService.getFileInfo(fileId, user);
+    const { path, size, format, originalFilename, inArchive } = await this.bookService.getFileInfo(fileId, user);
     if (resolveAudioMimeType(format)) throw new NotFoundException('File route not found');
     const mimeType = resolveBookMimeType(format);
     const filename = originalFilename;
 
     // An archive entry is inflated as a whole, so it is always served in full.
-    const inArchive = parseZipMemberPath(path) !== null;
     reply.header('Accept-Ranges', inArchive ? 'none' : 'bytes');
     reply.header('Content-Disposition', contentDispositionHeader('inline', filename, 'download'));
     reply.type(mimeType);

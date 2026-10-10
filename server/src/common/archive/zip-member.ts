@@ -1,13 +1,18 @@
 import { createReadStream, type Stats } from 'fs';
-import { readFile, stat } from 'fs/promises';
-import { pipeline, Transform, type Readable } from 'stream';
+import { open, readFile, stat } from 'fs/promises';
+import { pipeline, Readable, Transform } from 'stream';
 import * as unzipper from 'unzipper';
+import { crc32, createInflateRaw } from 'zlib';
 
 // A book kept inside a ZIP is addressed as "<archive>.zip/<entry>". That path can never exist on disk
 // (its parent is a file), so any filesystem write aimed at it fails instead of touching the archive.
 const ZIP_MEMBER_PATTERN = /\.zip\//i;
 const MAX_ENTRY_BYTES = 512 * 1024 * 1024;
 const DIRECTORY_CACHE_SIZE = 32;
+// End-of-central-directory record plus the longest comment a ZIP may carry.
+const MAX_EOCD_TAIL = 22 + 0xffff;
+const LOCAL_HEADER_SIGNATURE = 0x04034b50;
+const LOCAL_HEADER_BYTES = 30;
 
 export interface ZipMemberPath {
   zipPath: string;
@@ -19,12 +24,23 @@ export interface ZipEntryInfo {
   mtime: Date;
 }
 
+export interface BookFileInfo extends ZipEntryInfo {
+  inArchive: boolean;
+}
+
 interface CachedDirectory {
   version: string;
   entries: Map<string, unzipper.File>;
 }
 
+interface ArchiveEntry {
+  zipPath: string;
+  entry: unzipper.File;
+}
+
 const directories = new Map<string, CachedDirectory>();
+// The installed unzipper accepts directory options its type definitions leave out.
+const openZip = unzipper.Open.file as (path: string, options?: { tailSize?: number }) => Promise<unzipper.CentralDirectory>;
 
 export function parseZipMemberPath(path: string): ZipMemberPath | null {
   const match = ZIP_MEMBER_PATTERN.exec(path);
@@ -45,7 +61,8 @@ async function openDirectory(zipPath: string, archive: Stats): Promise<CachedDir
     directories.set(zipPath, cached);
     return cached;
   }
-  const directory = await unzipper.Open.file(zipPath);
+  // The default tail only finds an end record without a comment; widen it for archives that carry one.
+  const directory = await openZip(zipPath).catch(() => openZip(zipPath, { tailSize: MAX_EOCD_TAIL }));
   const entries = new Map(directory.files.filter((file) => file.type === 'File').map((file) => [file.path, file]));
   const fresh = { version, entries };
   directories.set(zipPath, fresh);
@@ -63,7 +80,7 @@ function missingEntry(path: string): NodeJS.ErrnoException {
 }
 
 /** Resolves the ZIP entry behind a member path, or null when the path is an ordinary file. */
-async function findEntry(path: string): Promise<unzipper.File | null> {
+async function findEntry(path: string): Promise<ArchiveEntry | null> {
   const member = parseZipMemberPath(path);
   if (!member) return null;
   const archive = await stat(member.zipPath).catch(() => null);
@@ -71,42 +88,77 @@ async function findEntry(path: string): Promise<unzipper.File | null> {
   const entry = (await openDirectory(member.zipPath, archive)).entries.get(member.entryName);
   if (!entry) throw missingEntry(path);
   if (entry.uncompressedSize > MAX_ENTRY_BYTES) throw new Error(`Archive entry is larger than ${MAX_ENTRY_BYTES} bytes: ${path}`);
-  return entry;
+  return { zipPath: member.zipPath, entry };
 }
 
-// The directory's size is a claim; an entry that inflates past it is refused rather than streamed.
-function capBytes(limit: number): Transform {
-  let seen = 0;
+async function entryDataStart({ zipPath, entry }: ArchiveEntry): Promise<number> {
+  const handle = await open(zipPath, 'r');
+  try {
+    const header = Buffer.alloc(LOCAL_HEADER_BYTES);
+    const { bytesRead } = await handle.read(header, 0, LOCAL_HEADER_BYTES, entry.offsetToLocalFileHeader);
+    if (bytesRead !== LOCAL_HEADER_BYTES || header.readUInt32LE(0) !== LOCAL_HEADER_SIGNATURE)
+      throw new Error('Archive entry has no valid local header');
+    return entry.offsetToLocalFileHeader + LOCAL_HEADER_BYTES + header.readUInt16LE(26) + header.readUInt16LE(28);
+  } finally {
+    await handle.close();
+  }
+}
+
+// The directory's size and CRC are claims; inflated bytes that disagree with them are a damaged entry.
+function verifyEntry(entry: unzipper.File): Transform {
+  let size = 0;
+  let crc = 0;
   return new Transform({
     transform(chunk: Buffer, _encoding, callback) {
-      seen += chunk.length;
-      callback(seen > limit ? new Error('Archive entry inflated past its declared size') : null, chunk);
+      size += chunk.length;
+      crc = crc32(chunk, crc);
+      callback(size > entry.uncompressedSize ? new Error('Archive entry inflated past its declared size') : null, chunk);
+    },
+    flush(callback) {
+      callback(size !== entry.uncompressedSize || crc !== entry.crc32 ? new Error('Archive entry is damaged') : null);
     },
   });
 }
 
-function streamEntry(entry: unzipper.File): Readable {
-  const capped = capBytes(entry.uncompressedSize);
-  pipeline(entry.stream(), capped, () => undefined);
-  return capped;
+async function streamEntry(source: ArchiveEntry): Promise<Readable> {
+  const { zipPath, entry } = source;
+  if (entry.flags & 0x1) throw new Error('Archive entry is encrypted');
+  if (entry.compressionMethod !== 0 && entry.compressionMethod !== 8)
+    throw new Error(`Unsupported archive compression method ${entry.compressionMethod}`);
+  const start = await entryDataStart(source);
+  const raw = entry.compressedSize > 0 ? createReadStream(zipPath, { start, end: start + entry.compressedSize - 1 }) : Readable.from([]);
+  const verified = verifyEntry(entry);
+  // One pipeline owns every stage, so a read error reaches the consumer and a cancelled read closes the file.
+  if (entry.compressionMethod === 8) pipeline(raw, createInflateRaw(), verified, () => undefined);
+  else pipeline(raw, verified, () => undefined);
+  return verified;
 }
 
-export async function statBookFile(path: string): Promise<ZipEntryInfo> {
-  const entry = await findEntry(path);
-  if (entry) return { size: entry.uncompressedSize, mtime: entry.lastModifiedDateTime };
+export async function statBookFile(path: string): Promise<BookFileInfo> {
+  const source = await findEntry(path);
+  if (source) return { size: source.entry.uncompressedSize, mtime: source.entry.lastModifiedDateTime, inArchive: true };
   const { size, mtime } = await stat(path);
-  return { size, mtime };
+  return { size, mtime, inArchive: false };
 }
 
 export async function readBookFile(path: string): Promise<Buffer> {
-  const entry = await findEntry(path);
-  if (!entry) return readFile(path);
+  const source = await findEntry(path);
+  if (!source) return readFile(path);
   const chunks: Buffer[] = [];
-  for await (const chunk of streamEntry(entry)) chunks.push(chunk as Buffer);
+  for await (const chunk of await streamEntry(source)) chunks.push(chunk as Buffer);
   return Buffer.concat(chunks);
 }
 
 export async function openBookFileStream(path: string): Promise<Readable> {
-  const entry = await findEntry(path);
-  return entry ? streamEntry(entry) : createReadStream(path);
+  const source = await findEntry(path);
+  return source ? streamEntry(source) : createReadStream(path);
+}
+
+/** A book stream that opens its file only when first read, for queues that hold many entries at once. */
+export function lazyBookFileStream(path: string): Readable {
+  return Readable.from(
+    (async function* () {
+      yield* await openBookFileStream(path);
+    })(),
+  );
 }

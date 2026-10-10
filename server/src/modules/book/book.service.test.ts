@@ -944,6 +944,7 @@ describe('BookService', () => {
         format: 'unknown',
         bookId: 1,
         originalFilename: 'test.book',
+        inArchive: false,
       });
     });
 

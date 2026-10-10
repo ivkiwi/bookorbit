@@ -1,11 +1,13 @@
 import { ZipArchive } from 'archiver';
 import { createWriteStream } from 'fs';
-import { mkdir, mkdtemp, rm, writeFile } from 'fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'fs/promises';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { listZipEntries, openBookFileStream, parseZipMemberPath, readBookFile, statBookFile, zipMemberPath } from './zip-member';
+import * as unzipper from 'unzipper';
+
+import { lazyBookFileStream, listZipEntries, openBookFileStream, parseZipMemberPath, readBookFile, statBookFile, zipMemberPath } from './zip-member';
 
 const cp1251Book = Buffer.concat([
   Buffer.from('<?xml version="1.0" encoding="windows-1251"?><FictionBook>'),
@@ -14,15 +16,15 @@ const cp1251Book = Buffer.concat([
 ]);
 const utf8Book = Buffer.from('<?xml version="1.0" encoding="UTF-8"?><FictionBook>Книга</FictionBook>'.repeat(200));
 
-async function writeZip(path: string, entries: Record<string, Buffer>): Promise<void> {
-  const archive = new ZipArchive();
+async function writeZip(path: string, entries: Record<string, Buffer>, options: { comment?: string; store?: boolean } = {}): Promise<void> {
+  const archive = new ZipArchive({ comment: options.comment });
   const done = new Promise<void>((resolve, reject) => {
     const out = createWriteStream(path);
     out.on('close', () => resolve());
     archive.on('error', reject);
     archive.pipe(out);
   });
-  for (const [name, bytes] of Object.entries(entries)) archive.append(bytes, { name });
+  for (const [name, bytes] of Object.entries(entries)) archive.append(bytes, { name, store: options.store });
   await archive.finalize();
   await done;
 }
@@ -76,6 +78,44 @@ describe('zip-member', () => {
   });
 
   it('treats a real directory named like an archive as ordinary files', async () => {
-    expect((await readBookFile(join(dir, 'real.zip', 'loose.fb2'))).toString()).toBe('loose');
+    const path = join(dir, 'real.zip', 'loose.fb2');
+    expect((await readBookFile(path)).toString()).toBe('loose');
+    expect((await statBookFile(path)).inArchive).toBe(false);
+    expect((await statBookFile(zipMemberPath(zipA, '1.fb2'))).inArchive).toBe(true);
+  });
+
+  it('opens archives that carry a long comment and stored entries', async () => {
+    const commented = join(dir, 'commented.zip');
+    await writeZip(commented, { '5.fb2': utf8Book }, { comment: 'c'.repeat(300) });
+    expect(await readBookFile(zipMemberPath(commented, '5.fb2'))).toEqual(utf8Book);
+
+    const stored = join(dir, 'stored.zip');
+    await writeZip(stored, { '6.fb2': cp1251Book }, { store: true });
+    expect(await readBookFile(zipMemberPath(stored, '6.fb2'))).toEqual(cp1251Book);
+  });
+
+  it('fails a damaged entry through the stream instead of returning wrong bytes', async () => {
+    const damaged = join(dir, 'damaged.zip');
+    const bytes = await readFile(zipA);
+    const entry = (await unzipper.Open.file(zipA)).files.find((file) => file.path === '2.fb2')!;
+    const dataStart =
+      entry.offsetToLocalFileHeader +
+      30 +
+      bytes.readUInt16LE(entry.offsetToLocalFileHeader + 26) +
+      bytes.readUInt16LE(entry.offsetToLocalFileHeader + 28);
+    bytes[dataStart + Math.floor(entry.compressedSize / 2)] ^= 0xff;
+    await writeFile(damaged, bytes);
+
+    await expect(readBookFile(zipMemberPath(damaged, '2.fb2'))).rejects.toThrow();
+    await expect(collect(await openBookFileStream(zipMemberPath(damaged, '2.fb2')))).rejects.toThrow();
+  });
+
+  it('releases a stream cancelled halfway and opens lazy streams on first read', async () => {
+    const stream = await openBookFileStream(zipMemberPath(zipA, '2.fb2'));
+    await new Promise<void>((resolve) => stream.once('data', () => resolve()));
+    stream.destroy();
+    await new Promise((resolve) => stream.once('close', resolve));
+
+    expect(await collect(lazyBookFileStream(zipMemberPath(zipB, '1.fb2')))).toEqual(utf8Book);
   });
 });

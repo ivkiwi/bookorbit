@@ -136,7 +136,7 @@ export class InpxImportService {
       if (existing && existing.status !== 'processing') continue;
 
       try {
-        await this.saveBook(input, path, record, entry, existing?.bookId);
+        await this.saveBook(input, path, record, entry, existing);
         if (!existing) counts.addedCount++;
       } catch (err) {
         this.logger.warn(
@@ -154,11 +154,19 @@ export class InpxImportService {
   }
 
   /** Creates the book, or finishes one an interrupted import left in processing. */
-  private async saveBook(input: InpxImportInput, path: string, record: InpRecord, entry: ZipEntryInfo, unfinishedBookId?: number): Promise<void> {
+  private async saveBook(
+    input: InpxImportInput,
+    path: string,
+    record: InpRecord,
+    entry: ZipEntryInfo,
+    unfinished?: { bookId: number; fileId: number },
+  ): Promise<void> {
     const { format } = classifyFile(path);
     let bookId: number;
-    if (unfinishedBookId !== undefined) {
-      bookId = unfinishedBookId;
+    if (unfinished) {
+      // An import cut off after the file row was written may not have linked it as the primary file yet.
+      await this.scannerRepo.updateBookPrimaryFile(unfinished.bookId, unfinished.fileId);
+      bookId = unfinished.bookId;
     } else {
       const book = await this.scannerRepo.createBook({
         libraryId: input.libraryId,

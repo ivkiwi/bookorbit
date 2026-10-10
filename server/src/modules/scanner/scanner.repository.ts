@@ -258,7 +258,7 @@ export class ScannerRepository {
 
   async findArchiveBookFiles(libraryFolderId: number, zipPath: string) {
     return this.db
-      .select({ bookId: bookFiles.bookId, absolutePath: bookFiles.absolutePath, status: books.status })
+      .select({ fileId: bookFiles.id, bookId: bookFiles.bookId, absolutePath: bookFiles.absolutePath, status: books.status })
       .from(bookFiles)
       .innerJoin(books, eq(books.id, bookFiles.bookId))
       .where(and(eq(bookFiles.libraryFolderId, libraryFolderId), sql`starts_with(${bookFiles.absolutePath}, ${`${zipPath}/`})`));

@@ -42,7 +42,7 @@ const row = (file: string, title: string, del = '0') => [
 type Status = 'present' | 'missing' | 'processing';
 
 class FakeScannerRepo {
-  books = new Map<number, { status: Status; folderPath: string }>();
+  books = new Map<number, { status: Status; folderPath: string; primaryFileId?: number }>();
   files: { bookId: number; absolutePath: string; libraryFolderId: number }[] = [];
   private nextId = 1;
 
@@ -55,7 +55,8 @@ class FakeScannerRepo {
     this.files.push(data);
     return Promise.resolve({ id: this.files.length });
   }
-  updateBookPrimaryFile() {
+  updateBookPrimaryFile(bookId: number, fileId: number) {
+    this.books.get(bookId)!.primaryFileId = fileId;
     return Promise.resolve();
   }
   promoteProcessingBookToPresent(bookId: number) {
@@ -67,7 +68,12 @@ class FakeScannerRepo {
     return Promise.resolve(
       this.files
         .filter((file) => file.libraryFolderId === libraryFolderId && file.absolutePath.startsWith(`${zipPath}/`))
-        .map((file) => ({ bookId: file.bookId, absolutePath: file.absolutePath, status: this.books.get(file.bookId)!.status })),
+        .map((file) => ({
+          fileId: this.files.indexOf(file) + 1,
+          bookId: file.bookId,
+          absolutePath: file.absolutePath,
+          status: this.books.get(file.bookId)!.status,
+        })),
     );
   }
   markBooksAsPresent(ids: number[]) {
@@ -153,6 +159,17 @@ describe('InpxImportService', () => {
 
     expect(await service.importFolder(input)).toEqual({ addedCount: 0, updatedCount: 0, missingCount: 0 });
     expect(repo.files).toHaveLength(3);
+  });
+
+  it('finishes a book an interrupted import left without a primary file', async () => {
+    await chmod(dir, 0o555);
+    const { repo, saved, service, input } = setup();
+    const cut = await repo.createBook({ folderPath: `${zipB}/3.fb2`, status: 'processing' });
+    await repo.createBookFile({ bookId: cut.id, absolutePath: `${zipB}/3.fb2`, libraryFolderId: 7 });
+
+    expect(await service.importFolder(input)).toEqual({ addedCount: 2, updatedCount: 0, missingCount: 0 });
+    expect(repo.books.get(cut.id)).toMatchObject({ status: 'present', primaryFileId: 1 });
+    expect(saved.get(cut.id)?.title).toBe('Воскресение');
   });
 
   it('restores returning books and marks books gone from the index missing', async () => {
