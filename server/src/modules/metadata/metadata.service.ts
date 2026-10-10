@@ -103,7 +103,7 @@ export class MetadataService {
   async fillCoverAndDescriptionFromFile(bookId: number, absolutePath: string, format: string): Promise<boolean> {
     const data = await this.extractionService.extract(absolutePath, format);
     if (!data) return false;
-    if (data.cover) await this.persistCover(bookId, this.mediumForFormat(format), data.cover, false, 'embedded');
+    // The annotation goes first: a saved cover is what stops later opens from trying again.
     if (data.description) {
       const { dto } = await this.bookMetadataLockService.filterAutomatedBookUpdate(bookId, { description: data.description });
       if (dto.description !== undefined) {
@@ -113,6 +113,7 @@ export class MetadataService {
           .where(and(eq(bookMetadata.bookId, bookId), sql`${bookMetadata.description} is null`));
       }
     }
+    if (data.cover) await this.persistCover(bookId, this.mediumForFormat(format), data.cover, false, 'embedded');
     await this.scoreService.calculateAndSave(bookId);
     return true;
   }

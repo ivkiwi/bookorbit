@@ -16,8 +16,12 @@ const cp1251Book = Buffer.concat([
 ]);
 const utf8Book = Buffer.from('<?xml version="1.0" encoding="UTF-8"?><FictionBook>Книга</FictionBook>'.repeat(200));
 
-async function writeZip(path: string, entries: Record<string, Buffer>, options: { comment?: string; store?: boolean } = {}): Promise<void> {
-  const archive = new ZipArchive({ comment: options.comment });
+async function writeZip(
+  path: string,
+  entries: Record<string, Buffer>,
+  options: { comment?: string; store?: boolean; forceZip64?: boolean } = {},
+): Promise<void> {
+  const archive = new ZipArchive({ comment: options.comment, forceZip64: options.forceZip64 });
   const done = new Promise<void>((resolve, reject) => {
     const out = createWriteStream(path);
     out.on('close', () => resolve());
@@ -89,9 +93,19 @@ describe('zip-member', () => {
     await writeZip(commented, { '5.fb2': utf8Book }, { comment: 'c'.repeat(300) });
     expect(await readBookFile(zipMemberPath(commented, '5.fb2'))).toEqual(utf8Book);
 
+    const smallZip64 = join(dir, 'small-zip64.zip');
+    await writeZip(smallZip64, { '7.fb2': cp1251Book }, { comment: 'z'.repeat(100), forceZip64: true });
+    expect(await readBookFile(zipMemberPath(smallZip64, '7.fb2'))).toEqual(cp1251Book);
+
     const stored = join(dir, 'stored.zip');
     await writeZip(stored, { '6.fb2': cp1251Book }, { store: true });
     expect(await readBookFile(zipMemberPath(stored, '6.fb2'))).toEqual(cp1251Book);
+  });
+
+  it('rejects a file that is not a ZIP at all', async () => {
+    const fake = join(dir, 'fake.zip');
+    await writeFile(fake, 'not a zip archive');
+    await expect(readBookFile(zipMemberPath(fake, '1.fb2'))).rejects.toThrow();
   });
 
   it('fails a damaged entry through the stream instead of returning wrong bytes', async () => {

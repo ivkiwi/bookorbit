@@ -1,6 +1,6 @@
 import { createReadStream, type Stats } from 'fs';
 import { open, readFile, stat } from 'fs/promises';
-import { pipeline, Readable, Transform } from 'stream';
+import { PassThrough, pipeline, Readable, Transform } from 'stream';
 import * as unzipper from 'unzipper';
 import { crc32, createInflateRaw } from 'zlib';
 
@@ -39,8 +39,14 @@ interface ArchiveEntry {
 }
 
 const directories = new Map<string, CachedDirectory>();
-// The installed unzipper accepts directory options its type definitions leave out.
-const openZip = unzipper.Open.file as (path: string, options?: { tailSize?: number }) => Promise<unzipper.CentralDirectory>;
+interface DirectorySource {
+  size(): Promise<number>;
+  stream(offset: number, length?: number): Readable;
+}
+// The installed unzipper exposes Open.custom, which its type definitions leave out.
+const openCustom = (
+  unzipper.Open as unknown as { custom(this: void, source: DirectorySource, options?: { tailSize?: number }): Promise<unzipper.CentralDirectory> }
+).custom;
 
 export function parseZipMemberPath(path: string): ZipMemberPath | null {
   const match = ZIP_MEMBER_PATTERN.exec(path);
@@ -61,13 +67,36 @@ async function openDirectory(zipPath: string, archive: Stats): Promise<CachedDir
     directories.set(zipPath, cached);
     return cached;
   }
-  // The default tail only finds an end record without a comment; widen it for archives that carry one.
-  const directory = await openZip(zipPath).catch(() => openZip(zipPath, { tailSize: MAX_EOCD_TAIL }));
+  const directory = await readDirectory(zipPath, archive.size);
   const entries = new Map(directory.files.filter((file) => file.type === 'File').map((file) => [file.path, file]));
   const fresh = { version, entries };
   directories.set(zipPath, fresh);
   if (directories.size > DIRECTORY_CACHE_SIZE) directories.delete(directories.keys().next().value!);
   return fresh;
+}
+
+// unzipper does not pass on read errors of the streams it opens for the directory, so a disk error
+// would escape as an uncaught exception. These streams end early instead and the cause is rethrown.
+async function readDirectory(zipPath: string, size: number): Promise<unzipper.CentralDirectory> {
+  let failure: Error | undefined;
+  const source: DirectorySource = {
+    size: () => Promise.resolve(size),
+    stream: (offset, length) => {
+      const out = new PassThrough();
+      const raw = createReadStream(zipPath, { start: offset, end: length ? offset + length - 1 : undefined });
+      raw.once('error', (err) => {
+        failure ??= err;
+        out.end();
+      });
+      return raw.pipe(out);
+    },
+  };
+  try {
+    // The default tail only finds an end record without a comment; widen it for archives that carry one.
+    return await openCustom(source).catch(() => openCustom(source, { tailSize: Math.min(MAX_EOCD_TAIL, size) }));
+  } catch (err) {
+    throw failure ?? err;
+  }
 }
 
 export async function listZipEntries(zipPath: string): Promise<Map<string, ZipEntryInfo>> {

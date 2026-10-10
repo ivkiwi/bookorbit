@@ -20,7 +20,8 @@ import { ZipArchive } from 'archiver';
 import { createReadStream } from 'fs';
 import { stat } from 'fs/promises';
 import type { FastifyReply } from 'fastify';
-import { lazyBookFileStream, openBookFileStream, parseZipMemberPath } from '../../common/archive/zip-member';
+import type { Readable } from 'stream';
+import { openBookFileStream, parseZipMemberPath } from '../../common/archive/zip-member';
 import { CurrentUser } from '../../common/decorators/current-user.decorator';
 import { RequirePermission } from '../../common/decorators/require-permission.decorator';
 import { contentDispositionHeader } from '../../common/utils/content-disposition.utils';
@@ -91,6 +92,27 @@ function resolveAudioMimeType(format: string | null): string | null {
 
 function resolveBookMimeType(format: string): string {
   return resolveAudioMimeType(format) ?? BOOK_MIME_TYPES[format.toLowerCase()] ?? 'application/octet-stream';
+}
+
+/** Settles once archiver has written the named entry, or fails with the source's own read error. */
+function entryWritten(archive: ZipArchive, name: string, source: Readable): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onEntry = (entry: { name: string }) => {
+      if (entry.name !== name) return;
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    const cleanup = () => {
+      archive.off('entry', onEntry);
+      source.off('error', onError);
+    };
+    archive.on('entry', onEntry);
+    source.once('error', onError);
+  });
 }
 
 @Controller('books')
@@ -289,8 +311,10 @@ export class BookController {
     let projectedBytes = 0;
     const archive = new ZipArchive({ zlib: { level: 0 } });
     let clientDisconnected = false;
+    let archiveSource: Readable | undefined;
     const handleDisconnect = () => {
       clientDisconnected = true;
+      archiveSource?.destroy();
       archive.abort();
     };
     reply.raw.on('close', handleDisconnect);
@@ -299,6 +323,7 @@ export class BookController {
       archive.on('warning', reject);
       archive.on('error', reject);
     });
+    archiveFailure.catch(() => undefined);
     try {
       const plan = await this.bookService.getExportFiles(bookIds, user, scope);
       plannedFiles = plan.files.length;
@@ -308,8 +333,17 @@ export class BookController {
       reply.raw.setHeader('Content-Disposition', contentDispositionHeader('attachment', plan.archiveFilename || 'books.zip', 'books.zip'));
       archive.pipe(reply.raw);
       for (const file of plan.files) {
-        if (parseZipMemberPath(file.absolutePath)) archive.append(lazyBookFileStream(file.absolutePath), { name: file.zipPath });
-        else archive.file(file.absolutePath, { name: file.zipPath });
+        if (clientDisconnected) break;
+        if (!parseZipMemberPath(file.absolutePath)) {
+          archive.file(file.absolutePath, { name: file.zipPath });
+          continue;
+        }
+        // An archive book is opened only when its turn comes, and archiver does not pass a source's errors on.
+        archiveSource = await openBookFileStream(file.absolutePath);
+        const written = entryWritten(archive, file.zipPath, archiveSource);
+        archive.append(archiveSource, { name: file.zipPath });
+        await Promise.race([written, archiveFailure]);
+        archiveSource = undefined;
       }
       await Promise.race([archive.finalize(), archiveFailure]);
 
@@ -326,6 +360,8 @@ export class BookController {
         return;
       }
 
+      archiveSource?.destroy();
+      archive.abort();
       const errorClass = err instanceof Error ? err.name : 'Error';
       const errorMessage = sanitizeLogValue(err instanceof Error ? err.message : String(err));
       this.logger.warn(
